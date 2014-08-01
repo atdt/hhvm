@@ -208,7 +208,6 @@ int RuntimeOption::XboxDefaultLocalTimeoutMilliSeconds = 500;
 int RuntimeOption::XboxDefaultRemoteTimeoutSeconds = 5;
 int RuntimeOption::XboxServerInfoMaxRequest = 500;
 int RuntimeOption::XboxServerInfoDuration = 120;
-std::string RuntimeOption::XboxServerInfoWarmupDoc;
 std::string RuntimeOption::XboxServerInfoReqInitFunc;
 std::string RuntimeOption::XboxServerInfoReqInitDoc;
 bool RuntimeOption::XboxServerInfoAlwaysReset = false;
@@ -233,7 +232,6 @@ bool RuntimeOption::EnableStaticContentMMap = true;
 bool RuntimeOption::Utf8izeReplace = true;
 
 std::string RuntimeOption::StartupDocument;
-std::string RuntimeOption::WarmupDocument;
 std::string RuntimeOption::RequestInitFunction;
 std::string RuntimeOption::RequestInitDocument;
 std::string RuntimeOption::AutoPrependFile;
@@ -1108,7 +1106,6 @@ void RuntimeOption::Load(const IniSetting::Map& ini,
 
     Config::Bind(StartupDocument, ini, server["StartupDocument"]);
     normalizePath(StartupDocument);
-    Config::Bind(WarmupDocument, ini, server["WarmupDocument"]);
     Config::Bind(RequestInitFunction, ini, server["RequestInitFunction"]);
     Config::Bind(RequestInitDocument, ini, server["RequestInitDocument"]);
 
@@ -1235,8 +1232,6 @@ void RuntimeOption::Load(const IniSetting::Map& ini,
                  500);
     Config::Bind(XboxServerInfoDuration, ini, xbox["ServerInfo.MaxDuration"],
                  120);
-    Config::Bind(XboxServerInfoWarmupDoc, ini,
-                 xbox["ServerInfo.WarmupDocument"], "");
     Config::Bind(XboxServerInfoReqInitFunc, ini,
                  xbox["ServerInfo.RequestInitFunction"], "");
     Config::Bind(XboxServerInfoReqInitDoc, ini,
