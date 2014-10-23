@@ -50,7 +50,7 @@ namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 // regex cache and helpers
 
-IMPLEMENT_THREAD_LOCAL(PCREglobals, s_pcre_globals);
+IMPLEMENT_THREAD_LOCAL(PCREglobals, tl_pcre_globals);
 
 pcre_cache_entry::~pcre_cache_entry() {
   if (extra) {
@@ -64,38 +64,21 @@ pcre_cache_entry::~pcre_cache_entry() {
   pcre_free(re);
 }
 
-void PCREglobals::onSessionExit() {
-  for (auto entry: m_overflow) {
-    delete entry;
-  }
-  smart::vector<const pcre_cache_entry*>().swap(m_overflow);
-}
-
-PCREglobals::~PCREglobals() {
-  onSessionExit();
-}
-
-void pcre_session_exit() {
-  s_pcre_globals->onSessionExit();
-}
-
-void PCREglobals::cleanupOnRequestEnd(const pcre_cache_entry* ent) {
-  m_overflow.push_back(ent);
-}
-
 struct ahm_string_data_same {
   bool operator()(const StringData* s1, const StringData* s2) {
     // ahm uses -1, -2, -3 as magic values
     return int64_t(s1) > 0 && (s1 == s2 || s1->same(s2));
   }
 };
-typedef folly::AtomicHashArray<const StringData*, const pcre_cache_entry*,
+typedef folly::AtomicHashArray<const StringData*, pcre_cache_entry_ptr,
                          string_data_hash, ahm_string_data_same> PCREStringMap;
-typedef std::pair<const StringData*, const pcre_cache_entry*> PCREEntry;
+typedef std::pair<const StringData*, pcre_cache_entry_ptr> PCREEntry;
 
 static std::atomic<PCREStringMap*> s_pcreCacheMap;
 static std::atomic<time_t> s_pcreCacheExpire;
 static std::mutex s_clearMutex;
+
+static StaticString s_bump_re_text("/./us");
 
 static PCREStringMap* pcre_cache_create() {
   PCREStringMap::Config config;
@@ -106,7 +89,7 @@ static PCREStringMap* pcre_cache_create() {
 
 static void pcre_cache_destroy(PCREStringMap* cache) {
   for (auto& it : *cache) {
-    delete it.second;
+    it.second.reset();
   }
   PCREStringMap::destroy(cache);
 }
@@ -127,14 +110,38 @@ void pcre_reinit() {
   s_pcreCacheExpire = time(nullptr) + RuntimeOption::EvalPCREExpireInterval;
 }
 
-static const pcre_cache_entry* lookup_cached_pcre(const String& regex) {
+void pcre_dump_cache(const std::string& filename) {
+  std::ofstream out(filename.c_str());
+  for (auto& it : *s_pcreCacheMap) {
+    out << it.first->data() << "\n";
+  }
+  out.close();
+}
+
+#if 0
+void pcre_dump_local_cache() {
+  for (auto& it : tl_pcre_globals->m_local_cache) {
+    std::cout << it.first << "\n";
+  }
+}
+#endif
+
+static const pcre_cache_entry_ptr pcre_lookup_static_cache(const String& regex) {
   assert(s_pcreCacheMap);
   PCREStringMap::iterator it;
   auto cache = s_pcreCacheMap.load(std::memory_order_acquire);
   if ((it = cache->find(regex.get())) != cache->end()) {
     return it->second;
   }
-  return 0;
+  return pcre_cache_entry_ptr(nullptr);
+}
+
+static const pcre_cache_entry_ptr pcre_lookup_local_cache(const String& regex) {
+  auto it = tl_pcre_globals->m_local_cache.find(regex.toCppString());
+  if (it != tl_pcre_globals->m_local_cache.end()) {
+    return it->second;
+  }
+  return pcre_cache_entry_ptr(nullptr);
 }
 
 static void pcre_clear_cache() {
@@ -152,25 +159,31 @@ static void pcre_clear_cache() {
    });
 }
 
-static const pcre_cache_entry*
-insert_cached_pcre(const String& regex, const pcre_cache_entry* ent) {
+static const pcre_cache_entry_ptr
+pcre_insert_local_cache(const String& regex, const pcre_cache_entry_ptr ent) {
+  tl_pcre_globals->m_local_cache.set(regex.toCppString(), ent);
+  return ent;
+}
+
+static const pcre_cache_entry_ptr
+pcre_insert_static_cache(const String& regex, const pcre_cache_entry_ptr ent) {
   assert(s_pcreCacheMap);
+  assert(regex.get()->isStatic());
   // Clear the cache if we haven't refreshed it in a while
   if (time(nullptr) > s_pcreCacheExpire) {
     pcre_clear_cache();
   }
   auto cache = s_pcreCacheMap.load(std::memory_order_acquire);
-  auto pair = cache->insert(
-    PCREEntry(makeStaticString(regex.get()), ent));
-  if (!pair.second) {
+  auto pair = cache->insert(PCREEntry(regex.get(), pcre_cache_entry_ptr(ent)));
+  if (pair.second) {
+    pair.first->second->setStatic();
+  } else {
     if (pair.first == cache->end()) {
-      // Global Cache is full
-      // still return the entry and free it at the end of the request
-      s_pcre_globals->cleanupOnRequestEnd(ent);
+      // Global Cache is full, insert into the local cache instead
+      pcre_insert_local_cache(regex, ent);
       return ent;
     }
-    // collision, delete the new one
-    delete ent;
+    // collision, return the old one, the new one will go out of scope
     return pair.first->second;
   }
   return ent;
@@ -183,10 +196,10 @@ insert_cached_pcre(const String& regex, const pcre_cache_entry* ent) {
  * FIXME: It's unclear why this needs to be thread-local data instead
  * of just existing on the stack during the calls to preg_ functions.
  */
-static __thread pcre_extra t_extra_data;
+static __thread pcre_extra tl_extra_data;
 
 // The last pcre error code is available for the whole thread.
-static __thread int t_last_error_code;
+static __thread int tl_last_error_code;
 
 namespace {
 
@@ -206,17 +219,20 @@ typedef FreeHelperImpl<true> SmartFreeHelper;
 
 static void set_extra_limits(pcre_extra*& extra) {
   if (extra == nullptr) {
-    pcre_extra& extra_data = t_extra_data;
+    pcre_extra& extra_data = tl_extra_data;
     extra_data.flags = PCRE_EXTRA_MATCH_LIMIT |
       PCRE_EXTRA_MATCH_LIMIT_RECURSION;
     extra = &extra_data;
   }
-  extra->match_limit = s_pcre_globals->m_preg_backtrace_limit;
-  extra->match_limit_recursion = s_pcre_globals->m_preg_recursion_limit;
+  extra->match_limit = tl_pcre_globals->m_preg_backtrace_limit;
+  extra->match_limit_recursion = tl_pcre_globals->m_preg_recursion_limit;
 }
 
-static char** get_subpat_names(pcre_cache_entry* pce) {
-  if (pce->subpat_names) return pce->subpat_names;
+static const char* const * get_subpat_names(const pcre_cache_entry* pce) {
+  char **subpat_names = pce->subpat_names.load(std::memory_order_relaxed);
+  if (subpat_names) {
+    return subpat_names;
+  }
 
   /*
   * Build a mapping from subpattern numbers to their names. We will always
@@ -227,8 +243,7 @@ static char** get_subpat_names(pcre_cache_entry* pce) {
   set_extra_limits(extra);
 
   int name_count;
-
-  pce->subpat_names = (char **)calloc(pce->num_subpats, sizeof(char *));
+  subpat_names = (char **)calloc(pce->num_subpats, sizeof(char *));
   int rc = pcre_fullinfo(pce->re, extra, PCRE_INFO_NAMECOUNT, &name_count);
   if (rc < 0) {
     raise_warning("Internal pcre_fullinfo() error %d", rc);
@@ -250,9 +265,9 @@ static char** get_subpat_names(pcre_cache_entry* pce) {
     while (ni++ < name_count) {
       name_idx = 0xff * (unsigned char)name_table[0] +
                  (unsigned char)name_table[1];
-      pce->subpat_names[name_idx] = name_table + 2;
-      if (is_numeric_string(pce->subpat_names[name_idx],
-                            strlen(pce->subpat_names[name_idx]),
+      subpat_names[name_idx] = name_table + 2;
+      if (is_numeric_string(subpat_names[name_idx],
+                            strlen(subpat_names[name_idx]),
                             nullptr, nullptr, 0) != KindOfNull) {
         raise_warning("Numeric named subpatterns are not allowed");
         return nullptr;
@@ -260,7 +275,16 @@ static char** get_subpat_names(pcre_cache_entry* pce) {
       name_table += name_size;
     }
   }
-  return pce->subpat_names;
+  // Store subpat_names into the cache entry
+  char **expected = nullptr;
+  if (!pce->subpat_names.compare_exchange_strong(expected, subpat_names)) {
+    // Another thread stored subpat_names already. The array created by the
+    // other thread is now in expected, return it instead and delete the one
+    // we just made.
+    free(subpat_names);
+    return expected;
+  }
+  return subpat_names;
 }
 
 static bool get_pcre_fullinfo(pcre_cache_entry* pce) {
@@ -278,12 +302,18 @@ static bool get_pcre_fullinfo(pcre_cache_entry* pce) {
   return true;
 }
 
-static const pcre_cache_entry*
+static const pcre_cache_entry_ptr
 pcre_get_compiled_regex_cache(const String& regex) {
+  pcre_cache_entry_ptr entry;
   /* Try to lookup the cached regex entry, and if successful, just pass
      back the compiled pattern, otherwise go on and compile it. */
-  if (const pcre_cache_entry* pce = lookup_cached_pcre(regex)) {
-    return pce;
+  entry = pcre_lookup_static_cache(regex);
+  if (entry.get() != nullptr) {
+    return entry;
+  }
+  entry = pcre_lookup_local_cache(regex);
+  if (entry.get() != nullptr) {
+    return entry;
   }
 
   /* Parse through the leading whitespace, and display a warning if we
@@ -292,7 +322,7 @@ pcre_get_compiled_regex_cache(const String& regex) {
   while (isspace((int)*(unsigned char *)p)) p++;
   if (*p == 0) {
     raise_warning("Empty regular expression");
-    return nullptr;
+    return pcre_cache_entry_ptr(nullptr);
   }
 
   /* Get the delimiter and display a warning if it is alphanumeric
@@ -300,7 +330,7 @@ pcre_get_compiled_regex_cache(const String& regex) {
   char delimiter = *p++;
   if (isalnum((int)*(unsigned char *)&delimiter) || delimiter == '\\') {
     raise_warning("Delimiter must not be alphanumeric or backslash");
-    return nullptr;
+    return pcre_cache_entry_ptr(nullptr);
   }
 
   char start_delimiter = delimiter;
@@ -324,7 +354,7 @@ pcre_get_compiled_regex_cache(const String& regex) {
     if (*pp == 0) {
       raise_warning("No ending delimiter '%c' found: [%s]", delimiter,
                       regex.data());
-      return nullptr;
+      return pcre_cache_entry_ptr(nullptr);
     }
   } else {
     /* We iterate through the pattern, searching for the matching ending
@@ -345,7 +375,7 @@ pcre_get_compiled_regex_cache(const String& regex) {
     if (*pp == 0) {
       raise_warning("No ending matching delimiter '%c' found: [%s]",
                       end_delimiter, regex.data());
-      return nullptr;
+      return pcre_cache_entry_ptr(nullptr);
     }
   }
 
@@ -393,7 +423,7 @@ pcre_get_compiled_regex_cache(const String& regex) {
 
     default:
       raise_warning("Unknown modifier '%c': [%s]", pp[-1], regex.data());
-      return nullptr;
+      return pcre_cache_entry_ptr(nullptr);
     }
   }
 
@@ -409,7 +439,7 @@ pcre_get_compiled_regex_cache(const String& regex) {
   pcre *re = pcre_compile(pattern, coptions, &error, &erroffset, 0);
   if (re == nullptr) {
     raise_warning("Compilation failed: %s at offset %d", error, erroffset);
-    return nullptr;
+    return pcre_cache_entry_ptr(nullptr);
   }
   // Careful: from here 're' needs to be freed if something throws.
 
@@ -434,23 +464,27 @@ pcre_get_compiled_regex_cache(const String& regex) {
   }
 
   /* Store the compiled pattern and extra info in the cache. */
-  pcre_cache_entry *new_entry = new pcre_cache_entry();
-  new_entry->re = re;
-  new_entry->extra = extra;
+  entry = new pcre_cache_entry();
+  entry->re = re;
+  entry->extra = extra;
 
   assert((poptions & ~0x1) == 0);
-  new_entry->preg_options = poptions;
+  entry->preg_options = poptions;
 
   assert((coptions & 0x80000000) == 0);
-  new_entry->compile_options = coptions;
+  entry->compile_options = coptions;
 
   /* Get pcre full info */
-  if (!get_pcre_fullinfo(new_entry)) {
-    delete new_entry;
-    return nullptr;
+  if (!get_pcre_fullinfo(entry.get())) {
+    return pcre_cache_entry_ptr(nullptr);
   }
 
-  return insert_cached_pcre(regex, new_entry);
+  if (regex.get()->isStatic()) {
+    entry = pcre_insert_static_cache(regex, entry);
+  } else {
+    entry = pcre_insert_local_cache(regex, entry);
+  }
+  return entry;
 }
 
 static int *create_offset_array(const pcre_cache_entry *pce,
@@ -502,8 +536,8 @@ static void pcre_log_error(const char *func, int line, int pcre_code,
     "limits=(%" PRId64 ", %" PRId64 "), extra=(%d, %d, %d, %d)",
     func, line, pcre_code, errString,
     escapedPattern, escapedSubject, escapedRepl,
-    s_pcre_globals->m_preg_backtrace_limit,
-    s_pcre_globals->m_preg_recursion_limit,
+    tl_pcre_globals->m_preg_backtrace_limit,
+    tl_pcre_globals->m_preg_recursion_limit,
     arg1, arg2, arg3, arg4);
   free((void *)escapedPattern);
   free((void *)escapedSubject);
@@ -529,19 +563,19 @@ static void pcre_handle_exec_error(int pcre_code) {
     preg_code = PHP_PCRE_INTERNAL_ERROR;
     break;
   }
-  t_last_error_code = preg_code;
+  tl_last_error_code = preg_code;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
 Variant preg_grep(const String& pattern, const Array& input, int flags /* = 0 */) {
-  const pcre_cache_entry* pce = pcre_get_compiled_regex_cache(pattern);
-  if (pce == nullptr) {
+  const pcre_cache_entry_ptr pce = pcre_get_compiled_regex_cache(pattern);
+  if (pce.get() == nullptr) {
     return false;
   }
 
   int size_offsets = 0;
-  int *offsets = create_offset_array(pce, size_offsets);
+  int *offsets = create_offset_array(pce.get(), size_offsets);
   if (offsets == nullptr) {
     return false;
   }
@@ -549,7 +583,7 @@ Variant preg_grep(const String& pattern, const Array& input, int flags /* = 0 */
 
   /* Initialize return array */
   Array ret = Array::Create();
-  t_last_error_code = PHP_PCRE_NO_ERROR;
+  tl_last_error_code = PHP_PCRE_NO_ERROR;
 
   /* Go through the input array */
   bool invert = (flags & PREG_GREP_INVERT);
@@ -596,8 +630,8 @@ Variant preg_grep(const String& pattern, const Array& input, int flags /* = 0 */
 static Variant preg_match_impl(const String& pattern, const String& subject,
                                Variant *subpats, int flags, int start_offset,
                                bool global) {
-  const pcre_cache_entry* pce = pcre_get_compiled_regex_cache(pattern);
-  if (pce == nullptr) {
+  const pcre_cache_entry_ptr pce = pcre_get_compiled_regex_cache(pattern);
+  if (pce.get() == nullptr) {
     return false;
   }
 
@@ -637,14 +671,14 @@ static Variant preg_match_impl(const String& pattern, const String& subject,
   }
 
   int size_offsets = 0;
-  int *offsets = create_offset_array(pce, size_offsets);
+  int *offsets = create_offset_array(pce.get(), size_offsets);
   SmartFreeHelper offsetsFreer(offsets);
   int num_subpats = size_offsets / 3;
   if (offsets == nullptr) {
     return false;
   }
 
-  char** subpat_names = get_subpat_names(const_cast<pcre_cache_entry *>(pce));
+  const char* const* subpat_names = get_subpat_names(pce.get());
   if (subpat_names == nullptr) {
     return false;
   }
@@ -659,7 +693,7 @@ static Variant preg_match_impl(const String& pattern, const String& subject,
   }
 
   int matched = 0;
-  t_last_error_code = PHP_PCRE_NO_ERROR;
+  tl_last_error_code = PHP_PCRE_NO_ERROR;
 
   int g_notempty = 0; // If the match should not be empty
   const char **stringlist; // Holds list of subpatterns
@@ -835,7 +869,7 @@ Variant preg_match_all(const String& pattern, const String& subject,
 ///////////////////////////////////////////////////////////////////////////////
 
 static String preg_do_repl_func(const Variant& function, const String& subject,
-                                int* offsets, char** subpat_names, int count) {
+                                int* offsets, const char* const* subpat_names, int count) {
   Array subpats = Array::Create();
   for (int i = 0; i < count; i++) {
     auto off1 = offsets[i<<1];
@@ -893,8 +927,8 @@ static bool preg_get_backref(const char **str, int *backref) {
 static Variant php_pcre_replace(const String& pattern, const String& subject,
                                 const Variant& replace_var, bool callable,
                                 int limit, int *replace_count) {
-  const pcre_cache_entry* pce = pcre_get_compiled_regex_cache(pattern);
-  if (pce == nullptr) {
+  const pcre_cache_entry_ptr pce = pcre_get_compiled_regex_cache(pattern);
+  if (pce.get() == nullptr) {
     return false;
   }
   bool eval = pce->preg_options & PREG_REPLACE_EVAL;
@@ -918,13 +952,13 @@ static Variant php_pcre_replace(const String& pattern, const String& subject,
   }
 
   int size_offsets;
-  int *offsets = create_offset_array(pce, size_offsets);
+  int *offsets = create_offset_array(pce.get(), size_offsets);
   SmartFreeHelper offsetsFreer(offsets);
   if (offsets == nullptr) {
     return false;
   }
 
-  char** subpat_names = get_subpat_names(const_cast<pcre_cache_entry *>(pce));
+  const char* const* subpat_names = get_subpat_names(pce.get());
   if (subpat_names == nullptr) {
     return false;
   }
@@ -948,7 +982,7 @@ static Variant php_pcre_replace(const String& pattern, const String& subject,
     /* Initialize */
     const char *match = nullptr;
     int start_offset = 0;
-    t_last_error_code = PHP_PCRE_NO_ERROR;
+    tl_last_error_code = PHP_PCRE_NO_ERROR;
     pcre_extra *extra = pce->extra;
     set_extra_limits(extra);
 
@@ -1305,8 +1339,8 @@ int preg_filter(Variant &result, const Variant& pattern, const Variant& replacem
 
 Variant preg_split(const String& pattern, const String& subject,
                    int limit /* = -1 */, int flags /* = 0 */) {
-  const pcre_cache_entry* pce = pcre_get_compiled_regex_cache(pattern);
-  if (pce == nullptr) {
+  const pcre_cache_entry_ptr pce = pcre_get_compiled_regex_cache(pattern);
+  if (pce.get() == nullptr) {
     return false;
   }
 
@@ -1319,7 +1353,7 @@ Variant preg_split(const String& pattern, const String& subject,
   }
 
   int size_offsets = 0;
-  int *offsets = create_offset_array(pce, size_offsets);
+  int *offsets = create_offset_array(pce.get(), size_offsets);
   SmartFreeHelper offsetsFreer(offsets);
   if (offsets == nullptr) {
     return false;
@@ -1329,7 +1363,7 @@ Variant preg_split(const String& pattern, const String& subject,
   int start_offset = 0;
   int next_offset = 0;
   const char *last_match = subject.data();
-  t_last_error_code = PHP_PCRE_NO_ERROR;
+  tl_last_error_code = PHP_PCRE_NO_ERROR;
   pcre_extra *extra = pce->extra;
   set_extra_limits(extra);
 
@@ -1337,7 +1371,7 @@ Variant preg_split(const String& pattern, const String& subject,
   Array return_value = Array::Create();
   int g_notempty = 0;   /* If the match should not be empty */
   int utf8_check = 0;
-  const pcre_cache_entry* bump_pce = nullptr; /* instance for empty matches */
+  pcre_cache_entry_ptr bump_pce; /* instance for empty matches */
   while ((limit == -1 || limit > 1)) {
     int count = pcre_exec(pce->re, extra, subject.data(), subject.size(),
                           start_offset, g_notempty | utf8_check,
@@ -1405,9 +1439,9 @@ Variant preg_split(const String& pattern, const String& subject,
          to achieve this, unless we're already at the end of the string. */
       if (g_notempty != 0 && start_offset < subject.size()) {
         if (pce->compile_options & PCRE_UTF8) {
-          if (bump_pce == nullptr) {
-            bump_pce = pcre_get_compiled_regex_cache("/./us");
-            if (bump_pce == nullptr) {
+          if (bump_pce.get() == nullptr) {
+            bump_pce = pcre_get_compiled_regex_cache(s_bump_re_text);
+            if (bump_pce.get() == nullptr) {
               return false;
             }
           }
@@ -1534,7 +1568,7 @@ String preg_quote(const String& str,
 }
 
 int preg_last_error() {
-  return t_last_error_code;
+  return tl_last_error_code;
 }
 
 size_t preg_pcre_cache_size() {
