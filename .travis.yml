@@ -1,16 +1,8 @@
 language: cpp
 
-# This doesn't work - travis defaults to plain gcc if unknown
-# http://github.com/travis-ci/travis-ci/issues/979
-# http://llvm.org/apt/
-compiler:
-  - gcc
-#  - gcc-4.8
-#  - clang-3.4
-#  - clang-3.5
+compiler: gcc
 
-cache:
-  - apt
+cache: apt
 
 services:
   - memcached
@@ -58,3 +50,17 @@ notifications:
 
 matrix:
   fast_finish: true
+
+env:
+  global:
+   - secure: "K7b8pcBnP8kVETceMgkqdE/uQkOIVOC1VkEXucz5AtGix6Zgcyogae0aGsjLj2TwYZmDUUhA/t2CcEpPS6Rfoaip56m0nKA9az1YWTjRas4rVMz35ZQkRv+UeBFZtl41rZY2UxDWX7CYUwoeuolgcOt30JlOoWLyOtS3YCbqHF0="
+
+addons:
+  coverity_scan:
+    project:
+      name: "atdt/hhvm"
+      description: "HHVM for PHP"
+    notification_email: ori@wikimedia.org
+    build_command_prepend: "sudo apt-get remove libsqlite3-dev ; TRAVIS=1 ./configure_generic.sh -DENABLE_COTIRE=ON"
+    build_command:   "make -j 6"
+    branch_pattern: master
